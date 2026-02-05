@@ -451,4 +451,107 @@ describe('ClientMqtt', () => {
       });
     });
   });
+  describe('emit race condition (issue #16302)', () => {
+    let client: ClientMqtt;
+    let untypedClient: any;
+    let mqttClient: any;
+    let publishSpy: sinon.SinonSpy;
+    let publishCallbacks: Array<{
+      topic: string;
+      payload: any;
+      options: any;
+      callback: Function;
+    }>;
+    let connectStub: sinon.SinonStub;
+
+    beforeEach(() => {
+      client = new ClientMqtt({});
+      untypedClient = client as any;
+      publishCallbacks = [];
+
+      // Mock publish to capture calls but delay execution
+      publishSpy = sinon.spy(
+        (topic: string, payload: any, options: any, callback: Function) => {
+          // Store callback for later execution
+          publishCallbacks.push({ topic, payload, options, callback });
+        },
+      );
+
+      mqttClient = {
+        publish: publishSpy,
+        subscribe: (channel: string, cb: Function) => cb(),
+        unsubscribe: sinon.spy(),
+        on: sinon.spy(),
+        addListener: sinon.spy(),
+        removeListener: sinon.spy(),
+      };
+      untypedClient.mqttClient = mqttClient;
+
+      // Stub connect to return immediately
+      connectStub = sinon.stub(client, 'connect').resolves();
+    });
+
+    afterEach(() => {
+      connectStub.restore();
+    });
+
+    it('should publish to the correct topic per emit call', async () => {
+      const topics = [
+        'cmd/device/123/reboot',
+        'cmd/device/456/update',
+        'cmd/device/789/status',
+      ];
+      const payloads = ['data1', 'data2', 'data3'];
+
+      // Rapidly emit to different topics
+      const observables = topics.map((topic, index) =>
+        client.emit(topic, payloads[index]),
+      );
+
+      // Wait a bit for all deferred observables to start executing
+      await new Promise(resolve => setImmediate(resolve));
+
+      // Now execute all publish callbacks to simulate async publish completion
+      publishCallbacks.forEach(({ callback }) => callback());
+
+      // Verify that each topic was published with correct data
+      expect(publishSpy.callCount).to.equal(topics.length);
+
+      // Extract actual topics from publish calls
+      const publishedTopics = publishCallbacks.map(call => call.topic);
+
+      // Check if all topics are present (order might vary due to async nature)
+      topics.forEach(expectedTopic => {
+        expect(publishedTopics).to.include(expectedTopic);
+      });
+
+      // More strict check: verify each call has unique topic
+      const uniqueTopics = new Set(publishedTopics);
+      expect(uniqueTopics.size).to.equal(topics.length);
+    });
+
+    it('should not reuse the last topic for all emits', async () => {
+      const topics = ['topic/a', 'topic/b', 'topic/c'];
+
+      // Emit to different topics without awaiting
+      topics.forEach((topic, index) => {
+        client.emit(topic, { index });
+      });
+
+      // Wait for all emits to queue up
+      await new Promise(resolve => setImmediate(resolve));
+
+      // Execute callbacks
+      publishCallbacks.forEach(({ callback }) => callback());
+
+      // The bug would manifest as all topics being 'topic/c' (the last one)
+      const publishedTopics = publishCallbacks.map(call => call.topic);
+
+      // Verify we have different topics, not all the same
+      const lastTopic = topics[topics.length - 1];
+      const allSameTopic = publishedTopics.every(t => t === lastTopic);
+
+      expect(allSameTopic).to.be.false;
+    });
+  });
 });
